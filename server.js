@@ -1,5 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -10,6 +11,10 @@ const {
   GROQ_API_KEY,
   GROQ_MODEL = "llama-3.1-8b-instant",
   DEFAULT_TZ = "America/Los_Angeles", // used until a user tells the coach their timezone
+  ADMIN_KEY, // guards /admin/* (falls back to SENDBLUE_API_SECRET)
+  STRIPE_WEBHOOK_SECRET, // set once Stripe is wired up; verifies webhook signatures
+  SUBSCRIBE_URL = "https://rehearse-143f.onrender.com", // where unpaid users go to subscribe
+  PRICE = "$29.99/month",
   PORT = 3000,
 } = process.env;
 
@@ -21,30 +26,56 @@ if (!SENDBLUE_API_KEY || !SENDBLUE_API_SECRET || !GROQ_API_KEY) {
 const MAX_TURNS = 40; // cap stored history (user+assistant messages) per number
 
 const app = express();
-app.use(express.json());
+// Stripe webhooks need the raw body for signature verification, so parse that
+// route as raw and everything else as JSON.
+app.use("/stripe/webhook", express.raw({ type: "*/*" }));
+app.use((req, res, next) => (req.originalUrl === "/stripe/webhook" ? next() : express.json()(req, res, next)));
 app.use(express.static(".")); // serves index.html (the landing page)
 
 /**
  * The coach's personality + rules. Tuned for texting: short, one question at a
  * time, brief feedback, encouraging. Sent to the model as the system message.
  */
-const BASE_PROMPT = `You are Rehearse, a friendly AI interview coach talking to someone over text message (iMessage/SMS).
+const BASE_PROMPT = `You are Rehearse, a professional and supportive AI interview coach speaking with a subscriber over text message (iMessage/SMS).
 
 STYLE:
-- Keep every reply SHORT — this is a text conversation, not an essay. Usually 1-4 sentences.
-- Warm, encouraging, and direct. No corporate fluff.
-- Use plain text only. No markdown, no bullet symbols, no headers.
+- Professional, clear, and encouraging — polished but warm. No slang, no fluff.
+- Keep every reply SHORT — this is texting. Usually 1-4 sentences.
+- Plain text only. No markdown, bullet symbols, or headers.
 
 HOW A SESSION WORKS:
-- When the user texts a company name (e.g. "Apple") or a role (e.g. "product manager"), start a mock interview tailored to it.
-- First, send a quick one-line intro confirming what you'll practice, then ask the FIRST question.
-- Ask ONE interview question at a time. Wait for their answer.
-- After each answer, give brief, specific feedback (1-2 sentences: what was strong + one thing to improve), then ask the next question.
-- Mix behavioral and role-relevant technical questions appropriate to the company/role.
-- If they say things like "stop", "new", "restart", or name a different company, gracefully switch.
-- If the very first message is just "hi" or unclear, greet them and ask which company or role they want to practice for.
+- When the user names a company (e.g. "Apple") or a role (e.g. "product manager"), begin a tailored mock interview.
+- Open with one brief line confirming what you'll practice, then ask the FIRST question.
+- Ask ONE question at a time and wait for their answer.
+- After each answer, give brief, specific, professional feedback (what was strong + one concrete improvement), then ask the next question.
+- Mix behavioral and role-relevant questions appropriate to the company/role.
+- If they say "stop", "new", "restart", or name a different company, switch gracefully.
+- If the first message is vague (e.g. "hi"), greet them professionally and ask which company or role they'd like to practice for.
 
-Keep it feeling like a real, momentum-building coaching session over text.`;
+Maintain a focused, momentum-building session that measurably improves their answers.`;
+
+/**
+ * Prompt for people who have NOT subscribed. The coach stays professional and
+ * helpful, explains the value, and guides them to subscribe — but withholds the
+ * actual coaching (no mock questions, no feedback) until they pay.
+ */
+function buildSalesPrompt() {
+  return `You are Rehearse, a professional AI interview coach, texting someone over iMessage who has NOT yet subscribed.
+
+YOUR GOAL: Be genuinely helpful and professional, build their interest, and gently guide them to subscribe — without giving away the coaching itself.
+
+STRICT RULES (do not break these):
+- Do NOT run a mock interview, ask practice interview questions, evaluate answers, or give interview tips/feedback. That is for subscribers only.
+- If they ask you to practice or coach them, warmly acknowledge it and explain that full coaching is included with a Rehearse subscription, then invite them to start.
+- Keep replies short (1-3 sentences), polished, warm, and professional. Plain text only.
+
+WHAT TO CONVEY over the conversation (naturally, not all at once):
+- Rehearse is a professional AI interview coach that lives in your texts: realistic mock interviews for any company or role, instant specific feedback, proactive reminders before your real interview, and daily practice questions.
+- It is ${PRICE} for unlimited everything, cancel anytime.
+- To begin, they subscribe here: ${SUBSCRIBE_URL}
+
+STYLE: Confident, encouraging, never pushy or salesy. Sell subtly — be so helpful that the value is obvious. When they seem interested, make subscribing the clear next step and share the link.`;
+}
 
 /**
  * Build the full system prompt for a given user, injecting the current time (in
@@ -132,6 +163,35 @@ function nowInTz(tz) {
   }).formatToParts(new Date()).reduce((a, x) => ((a[x.type] = x.value), a), {});
   const hour = p.hour === "24" ? "00" : p.hour;
   return { date: `${p.year}-${p.month}-${p.day}`, hhmm: `${hour}:${p.minute}` };
+}
+
+/**
+ * Subscription state. A number is "paid" once Stripe confirms an active
+ * subscription (or an admin grants it). In-memory for now — Stripe is the source
+ * of truth, so a persistent store can be added when we wire Stripe fully.
+ */
+const paidNumbers = new Set();
+function isPaid(number) { return paidNumbers.has(number); }
+function setPaid(number, paid) { paid ? paidNumbers.add(number) : paidNumbers.delete(number); }
+
+/** Normalize a phone string to E.164-ish for consistent matching. */
+function normalizePhone(p) {
+  if (!p) return p;
+  const d = String(p).replace(/[^\d]/g, "");
+  if (d.length === 10) return `+1${d}`;
+  return `+${d}`;
+}
+
+/** Verify a Stripe webhook signature (so we don't need the Stripe SDK). */
+function verifyStripe(rawBody, sigHeader, secret) {
+  const parts = Object.fromEntries(String(sigHeader).split(",").map((kv) => kv.split("=")));
+  const signed = `${parts.t}.${rawBody.toString("utf8")}`;
+  const expected = crypto.createHmac("sha256", secret).update(signed).digest("hex");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(parts.v1 || "");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) throw new Error("signature mismatch");
+  if (Math.abs(Date.now() / 1000 - Number(parts.t)) > 300) throw new Error("timestamp out of tolerance");
+  return JSON.parse(rawBody.toString("utf8"));
 }
 
 /** Call Groq (OpenAI-compatible) with the running history; return the reply text. */
@@ -369,10 +429,13 @@ app.post("/webhook/sendblue", async (req, res) => {
     await sbNotify("mark-read", from_number, line);
     await sbNotify("send-typing-indicator", from_number, line);
 
+    // Paywall: subscribers get full coaching; everyone else gets the sales flow.
+    const paid = isPaid(from_number);
     const history = getHistory(from_number);
     history.push({ role: "user", content });
 
-    const reply = stripDirectives(await askModel(history, buildSystemPrompt(from_number)));
+    const systemPrompt = paid ? buildSystemPrompt(from_number) : buildSalesPrompt();
+    const reply = stripDirectives(await askModel(history, systemPrompt));
     history.push({ role: "assistant", content: reply });
 
     // Trim old turns to cap memory use.
@@ -387,10 +450,10 @@ app.post("/webhook/sendblue", async (req, res) => {
     await new Promise((r) => setTimeout(r, typingMs));
 
     await sendText(from_number, reply, line);
-    console.log(`→ ${from_number}: ${reply}`);
+    console.log(`→ ${from_number} (${paid ? "paid" : "free"}): ${reply}`);
 
-    // Second pass (after replying): detect & store any scheduling request.
-    await extractAndApply(from_number, line, history);
+    // Scheduling is a paid feature — only run the extractor for subscribers.
+    if (paid) await extractAndApply(from_number, line, history);
   } catch (err) {
     console.error("webhook error:", err.message);
   }
@@ -400,21 +463,76 @@ app.post("/webhook/sendblue", async (req, res) => {
 // inbound text without going through Sendblue. Replies in the JSON response.
 app.post("/test", async (req, res) => {
   try {
-    const { number = "+10000000000", content, line } = req.body || {};
+    const { number = "+10000000000", content, line, paid: paidFlag } = req.body || {};
     if (!content) return res.status(400).json({ error: "content required" });
+    const paid = paidFlag !== undefined ? !!paidFlag : isPaid(number);
     const history = getHistory(number);
     history.push({ role: "user", content });
-    const reply = stripDirectives(await askModel(history, buildSystemPrompt(number)));
+    const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt()));
     history.push({ role: "assistant", content: reply });
-    await extractAndApply(number, line, history);
-    res.json({ reply, reminders: reminders.filter((r) => r.number === number), tz: tzFor(number) });
+    if (paid) await extractAndApply(number, line, history);
+    res.json({ reply, paid, reminders: reminders.filter((r) => r.number === number), tz: tzFor(number) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Heartbeat target: a scheduler (GitHub Actions) hits this every few minutes to
-// keep the server awake and fire any due reminders. Safe to call publicly — it
+// ---------------------------------------------------------------------------
+// Subscription endpoints
+// ---------------------------------------------------------------------------
+
+const ADMIN_SECRET = ADMIN_KEY || SENDBLUE_API_SECRET;
+const adminOK = (req) => (req.query.key || req.headers["x-admin-key"]) === ADMIN_SECRET;
+
+// Manually grant/revoke access (for testing now; Stripe handles it in production).
+app.post("/admin/grant", (req, res) => {
+  if (!adminOK(req)) return res.sendStatus(403);
+  const n = normalizePhone(req.query.number || req.body?.number);
+  if (!n) return res.status(400).json({ error: "number required" });
+  setPaid(n, true);
+  res.json({ ok: true, number: n, paid: true });
+});
+app.post("/admin/revoke", (req, res) => {
+  if (!adminOK(req)) return res.sendStatus(403);
+  const n = normalizePhone(req.query.number || req.body?.number);
+  if (!n) return res.status(400).json({ error: "number required" });
+  setPaid(n, false);
+  res.json({ ok: true, number: n, paid: false });
+});
+app.get("/admin/status", (req, res) => {
+  if (!adminOK(req)) return res.sendStatus(403);
+  res.json({ paid: [...paidNumbers] });
+});
+
+// Stripe webhook — flips a number to paid/unpaid when a subscription starts or
+// ends. Ready for when Stripe is configured (STRIPE_WEBHOOK_SECRET).
+app.post("/stripe/webhook", (req, res) => {
+  let event;
+  try {
+    event = STRIPE_WEBHOOK_SECRET
+      ? verifyStripe(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET)
+      : JSON.parse(req.body.toString("utf8"));
+  } catch (err) {
+    console.warn("stripe verify failed:", err.message);
+    return res.sendStatus(400);
+  }
+  try {
+    const o = event.data?.object || {};
+    const phone = normalizePhone(o.customer_details?.phone || o.metadata?.phone || o.phone || "");
+    const start = ["checkout.session.completed", "invoice.paid", "customer.subscription.created"];
+    const end = ["customer.subscription.deleted", "invoice.payment_failed"];
+    if (phone && phone !== "+") {
+      if (start.includes(event.type)) { setPaid(phone, true); console.log("✅ subscribed:", phone); }
+      else if (end.includes(event.type)) { setPaid(phone, false); console.log("⛔ unsubscribed:", phone); }
+    }
+  } catch (err) {
+    console.error("stripe handler error:", err.message);
+  }
+  res.json({ received: true });
+});
+
+// Heartbeat target: a scheduler (or our own self-ping) hits this every few minutes
+// to keep the server awake and fire any due reminders. Safe to call publicly — it
 // only sends reminders the user already scheduled.
 app.all("/cron/tick", async (_req, res) => {
   try {
