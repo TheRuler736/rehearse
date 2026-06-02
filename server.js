@@ -168,6 +168,12 @@ app.post("/webhook/sendblue", async (req, res) => {
       history.splice(0, history.length - MAX_TURNS);
     }
 
+    // The model answers in ~1s, so the typing bubble would flash by unseen.
+    // Hold briefly (scaled to reply length, capped) so the "…" is actually visible
+    // and the coach feels like it's typing rather than firing back instantly.
+    const typingMs = Math.min(1200 + reply.length * 25, 4000);
+    await new Promise((r) => setTimeout(r, typingMs));
+
     await sendText(from_number, reply, line);
     console.log(`→ ${from_number}: ${reply}`);
   } catch (err) {
