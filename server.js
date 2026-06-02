@@ -108,6 +108,32 @@ async function sendText(number, content, fromNumber) {
 }
 
 /**
+ * Best-effort Sendblue notification (typing indicator / read receipt).
+ * These are cosmetic, iMessage-only, and must never break the actual reply,
+ * so failures are logged and swallowed rather than thrown.
+ * NOTE: read receipts (mark-read) require Sendblue to enable them on the account.
+ */
+async function sbNotify(path, number, fromNumber) {
+  try {
+    const body = { number };
+    const from = fromNumber || SENDBLUE_FROM_NUMBER;
+    if (from) body.from_number = from;
+    const res = await fetch(`https://api.sendblue.co/api/${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "sb-api-key-id": SENDBLUE_API_KEY,
+        "sb-api-secret-key": SENDBLUE_API_SECRET,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) console.warn(`${path} ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  } catch (err) {
+    console.warn(`${path} error:`, err.message);
+  }
+}
+
+/**
  * Sendblue posts every inbound message here.
  * Set this URL as your "Receive URL" in the Sendblue dashboard.
  */
@@ -126,6 +152,10 @@ app.post("/webhook/sendblue", async (req, res) => {
 
     // Which of our lines received this? Reply from that same line.
     const line = req.body.to_number || req.body.number || SENDBLUE_FROM_NUMBER;
+
+    // Mark their message "Read" and show the typing "…" bubble while we think.
+    await sbNotify("mark-read", from_number, line);
+    await sbNotify("send-typing-indicator", from_number, line);
 
     const history = getHistory(from_number);
     history.push({ role: "user", content });
