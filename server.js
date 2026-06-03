@@ -177,7 +177,12 @@ function nowInTz(tz) {
  * subscription (or an admin grants it). In-memory for now — Stripe is the source
  * of truth, so a persistent store can be added when we wire Stripe fully.
  */
-const paidNumbers = new Set();
+const paidNumbers = new Set();   // everyone with access now (Stripe-active ∪ manual grants)
+const manualGrants = new Set();  // admin grants, not backed by Stripe (survive authoritative sync)
+const customerId = new Map();    // phone -> Stripe customer id (to persist per-user state)
+const lazyChecked = new Map();   // phone -> last Stripe lookup ts (negative cache)
+let stateLoaded = false;         // have we rehydrated reminders from Stripe yet?
+
 function isPaid(number) { return paidNumbers.has(number); }
 function setPaid(number, paid) { paid ? paidNumbers.add(number) : paidNumbers.delete(number); }
 
@@ -205,10 +210,19 @@ async function stripeApi(path, { method = "GET", body } = {}) {
   return j;
 }
 
+/** Re-add a persisted reminder on boot (skipping one-offs whose time has passed). */
+function rehydrateReminder(r) {
+  if (!r || typeof r !== "object") return;
+  if (r.kind === "once" && (!r.fireAt || r.fireAt <= Date.now())) return;
+  reminders.push({ ...r, id: reminderSeq++ });
+}
+
 /**
- * Rebuild the paid list from Stripe (the source of truth). Runs on startup and
- * periodically, so paid customers stay unlocked even after the server restarts.
- * Relies on each customer's metadata.phone, which the webhook stamps at checkout.
+ * Authoritatively rebuild the paid list from Stripe (the source of truth) plus any
+ * manual admin grants. Runs on startup and every few minutes, so paid customers
+ * stay unlocked across restarts and canceled ones are dropped even if a webhook
+ * was missed. On the first run it also rehydrates each subscriber's reminders +
+ * timezone from their Stripe customer metadata.
  */
 async function syncPaidFromStripe() {
   if (!STRIPE_SECRET_KEY) return;
@@ -216,16 +230,69 @@ async function syncPaidFromStripe() {
     const params = new URLSearchParams({ status: "active", limit: "100" });
     params.append("expand[]", "data.customer");
     const subs = await stripeApi("subscriptions?" + params.toString());
-    let n = 0;
+    const active = new Set();
     for (const sub of subs.data || []) {
       const c = sub.customer || {};
       const phone = normalizePhone(c.metadata?.phone || c.phone || "");
-      if (phone && phone !== "+") { setPaid(phone, true); n++; }
+      if (!phone || phone === "+") continue;
+      active.add(phone);
+      customerId.set(phone, c.id);
+      if (!stateLoaded) {
+        if (c.metadata?.tz && isValidTz(c.metadata.tz)) timezones.set(phone, c.metadata.tz);
+        if (c.metadata?.reminders) {
+          try { for (const r of JSON.parse(c.metadata.reminders)) rehydrateReminder(r); } catch { /* ignore bad blob */ }
+        }
+      }
     }
-    console.log(`Stripe sync: ${n} active subscriber(s) loaded`);
+    // Authoritative: access = currently-active Stripe subs ∪ manual grants.
+    paidNumbers.clear();
+    for (const p of active) paidNumbers.add(p);
+    for (const p of manualGrants) paidNumbers.add(p);
+    stateLoaded = true;
+    console.log(`Stripe sync: ${active.size} active subscriber(s)`);
   } catch (err) {
     console.warn("Stripe sync failed:", err.message);
   }
+}
+
+/** Persist a paid user's reminders + timezone into their Stripe customer metadata. */
+async function saveCustomerState(number) {
+  const cid = customerId.get(number);
+  if (!cid || !STRIPE_SECRET_KEY) return;
+  let mine = reminders.filter((r) => r.number === number).map(({ id, ...rest }) => rest);
+  let blob = JSON.stringify(mine);
+  while (blob.length > 480 && mine.length) { mine.shift(); blob = JSON.stringify(mine); } // Stripe metadata caps ~500 chars
+  const body = new URLSearchParams();
+  body.set("metadata[reminders]", blob);
+  body.set("metadata[tz]", tzFor(number));
+  stripeApi("customers/" + cid, { method: "POST", body: body.toString() }).catch((e) => console.warn("save state:", e.message));
+}
+
+/**
+ * For an unknown caller, ask Stripe directly whether they have an active
+ * subscription (covers the gap right after a restart, and people who pay on the
+ * website then text in). Negative results are cached ~10 min to avoid hammering.
+ */
+async function lazyStripeCheck(number) {
+  if (!STRIPE_SECRET_KEY) return false;
+  const last = lazyChecked.get(number) || 0;
+  if (Date.now() - last < 10 * 60 * 1000) return false;
+  lazyChecked.set(number, Date.now());
+  try {
+    const q = encodeURIComponent(`metadata['phone']:'${number}'`);
+    const found = await stripeApi(`customers/search?query=${q}&limit=1`);
+    const cust = found.data?.[0];
+    if (!cust) return false;
+    const subs = await stripeApi(`subscriptions?customer=${cust.id}&status=active&limit=1`);
+    if (subs.data?.length) {
+      setPaid(number, true);
+      customerId.set(number, cust.id);
+      return true;
+    }
+  } catch (err) {
+    console.warn("lazy check:", err.message);
+  }
+  return false;
 }
 
 /** Verify a Stripe webhook signature (so we don't need the Stripe SDK). */
@@ -416,6 +483,7 @@ function applyDirectives(number, line, text) {
         context: parts[2] || "general interview", lastSent: null });
     }
   }
+  saveCustomerState(number); // persist reminder/timezone changes to Stripe
   return text.replace(DIRECTIVE_RE, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
@@ -477,12 +545,14 @@ async function generateDailyQuestion(context) {
 async function runDueReminders() {
   const now = Date.now();
   let sent = 0;
+  const changed = new Set();
   for (let i = reminders.length - 1; i >= 0; i--) {
     const r = reminders[i];
     try {
       if (r.kind === "once" && r.fireAt <= now) {
         await deliverProactive(r, r.note);
         reminders.splice(i, 1);
+        changed.add(r.number);
         sent++;
       } else if (r.kind === "daily") {
         const { date, hhmm } = nowInTz(tzFor(r.number));
@@ -490,6 +560,7 @@ async function runDueReminders() {
           // Only mark "sent today" if the send actually succeeds, so a failure retries next tick.
           await deliverProactive(r, await generateDailyQuestion(r.context));
           r.lastSent = date;
+          changed.add(r.number);
           sent++;
         }
       }
@@ -497,7 +568,18 @@ async function runDueReminders() {
       console.error("reminder fire error:", err.message);
     }
   }
+  for (const number of changed) saveCustomerState(number); // persist fired/updated reminders
   return { sent, pending: reminders.length };
+}
+
+// Simple per-number rate limit so a single sender can't run up Groq/Sendblue cost.
+const rateWindow = new Map(); // number -> recent message timestamps
+function rateLimited(number) {
+  const now = Date.now();
+  const recent = (rateWindow.get(number) || []).filter((t) => now - t < 60000);
+  recent.push(now);
+  rateWindow.set(number, recent);
+  return recent.length > 12; // >12 messages/minute from one number
 }
 
 /**
@@ -509,13 +591,13 @@ app.post("/webhook/sendblue", async (req, res) => {
   res.sendStatus(200);
 
   try {
-    console.log("inbound payload:", JSON.stringify(req.body));
     const { content, from_number, is_outbound } = req.body || {};
 
     // Ignore our own outbound messages and empty payloads.
     if (is_outbound || !content || !from_number) return;
+    if (rateLimited(from_number)) { console.warn("rate limited:", from_number); return; }
 
-    console.log(`← ${from_number}: ${content}`);
+    console.log(`← ${from_number} (${content.length} chars)`);
     lastSeen.set(from_number, Date.now()); // track activity for lead cleanup
 
     // Which of our lines received this? Reply from that same line.
@@ -526,7 +608,8 @@ app.post("/webhook/sendblue", async (req, res) => {
     await sbNotify("send-typing-indicator", from_number, line);
 
     // Paywall: subscribers get full coaching; everyone else gets the sales flow.
-    const paid = isPaid(from_number);
+    let paid = isPaid(from_number);
+    if (!paid) paid = await lazyStripeCheck(from_number); // catch website / post-restart payers
     const history = getHistory(from_number);
     history.push({ role: "user", content });
 
@@ -546,7 +629,7 @@ app.post("/webhook/sendblue", async (req, res) => {
     await new Promise((r) => setTimeout(r, typingMs));
 
     await sendText(from_number, reply, line);
-    console.log(`→ ${from_number} (${paid ? "paid" : "free"}): ${reply}`);
+    console.log(`→ ${from_number} (${paid ? "paid" : "free"})`);
 
     // Scheduling is a paid feature — only run the extractor for subscribers.
     if (paid) await extractAndApply(from_number, line, history);
@@ -558,10 +641,11 @@ app.post("/webhook/sendblue", async (req, res) => {
 // Local test endpoint: POST {"number":"+1...","content":"Apple"} to simulate an
 // inbound text without going through Sendblue. Replies in the JSON response.
 app.post("/test", async (req, res) => {
+  if (!adminOK(req)) return res.sendStatus(403); // not public — it can bypass the paywall
   try {
     const { number = "+10000000000", content, line, paid: paidFlag } = req.body || {};
     if (!content) return res.status(400).json({ error: "content required" });
-    const paid = paidFlag !== undefined ? !!paidFlag : isPaid(number);
+    const paid = paidFlag !== undefined ? !!paidFlag : (isPaid(number) || await lazyStripeCheck(number));
     const history = getHistory(number);
     history.push({ role: "user", content });
     const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt(number)));
@@ -585,6 +669,7 @@ app.post("/admin/grant", (req, res) => {
   if (!adminOK(req)) return res.sendStatus(403);
   const n = normalizePhone(req.query.number || req.body?.number);
   if (!n) return res.status(400).json({ error: "number required" });
+  manualGrants.add(n);
   setPaid(n, true);
   res.json({ ok: true, number: n, paid: true });
 });
@@ -592,6 +677,7 @@ app.post("/admin/revoke", (req, res) => {
   if (!adminOK(req)) return res.sendStatus(403);
   const n = normalizePhone(req.query.number || req.body?.number);
   if (!n) return res.status(400).json({ error: "number required" });
+  manualGrants.delete(n);
   setPaid(n, false);
   res.json({ ok: true, number: n, paid: false });
 });
@@ -626,11 +712,14 @@ app.post("/stripe/webhook", (req, res) => {
   try {
     const o = event.data?.object || {};
     const phone = normalizePhone(o.client_reference_id || o.customer_details?.phone || o.metadata?.phone || o.phone || "");
-    const start = ["checkout.session.completed", "invoice.paid", "customer.subscription.created"];
-    const end = ["customer.subscription.deleted", "invoice.payment_failed"];
+    // Unlock only when payment is confirmed; revoke only on a real cancellation
+    // (NOT on a single failed charge — Stripe retries those for days).
+    const start = ["checkout.session.completed", "invoice.paid"];
+    const end = ["customer.subscription.deleted"];
     if (phone && phone !== "+") {
       if (start.includes(event.type)) {
         setPaid(phone, true);
+        if (o.customer) customerId.set(phone, o.customer);
         console.log("✅ subscribed:", phone);
         verifyContact(phone); // make sure we can text them (reminders, etc.)
         // Stamp the phone on the Stripe customer so restarts can re-sync from Stripe.
@@ -638,6 +727,7 @@ app.post("/stripe/webhook", (req, res) => {
           stripeApi("customers/" + o.customer, { method: "POST", body: new URLSearchParams({ "metadata[phone]": phone }).toString() }).catch(() => {});
         }
       } else if (end.includes(event.type)) {
+        manualGrants.delete(phone);
         setPaid(phone, false);
         console.log("⛔ unsubscribed:", phone);
       }
