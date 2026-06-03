@@ -59,7 +59,12 @@ Maintain a focused, momentum-building session that measurably improves their ans
  * helpful, explains the value, and guides them to subscribe — but withholds the
  * actual coaching (no mock questions, no feedback) until they pay.
  */
-function buildSalesPrompt() {
+function buildSalesPrompt(number) {
+  // Personalize the subscribe link with the texter's number so Stripe ties the
+  // payment back to the exact phone they message from (matched via client_reference_id).
+  const link = number
+    ? `${SUBSCRIBE_URL}${SUBSCRIBE_URL.includes("?") ? "&" : "?"}client_reference_id=${String(number).replace(/\D/g, "")}`
+    : SUBSCRIBE_URL;
   return `You are Rehearse, a professional AI interview coach, texting someone over iMessage who has NOT yet subscribed.
 
 YOUR GOAL: Be genuinely helpful and professional, build their interest, and gently guide them to subscribe — without giving away the coaching itself.
@@ -72,7 +77,7 @@ STRICT RULES (do not break these):
 WHAT TO CONVEY over the conversation (naturally, not all at once):
 - Rehearse is a professional AI interview coach that lives in your texts: realistic mock interviews for any company or role, instant specific feedback, proactive reminders before your real interview, and daily practice questions.
 - It is ${PRICE} for unlimited everything, cancel anytime.
-- To begin, they subscribe here: ${SUBSCRIBE_URL}
+- To begin, they subscribe here: ${link}
 
 STYLE: Confident, encouraging, never pushy or salesy. Sell subtly — be so helpful that the value is obvious. When they seem interested, make subscribing the clear next step and share the link.`;
 }
@@ -434,7 +439,7 @@ app.post("/webhook/sendblue", async (req, res) => {
     const history = getHistory(from_number);
     history.push({ role: "user", content });
 
-    const systemPrompt = paid ? buildSystemPrompt(from_number) : buildSalesPrompt();
+    const systemPrompt = paid ? buildSystemPrompt(from_number) : buildSalesPrompt(from_number);
     const reply = stripDirectives(await askModel(history, systemPrompt));
     history.push({ role: "assistant", content: reply });
 
@@ -468,7 +473,7 @@ app.post("/test", async (req, res) => {
     const paid = paidFlag !== undefined ? !!paidFlag : isPaid(number);
     const history = getHistory(number);
     history.push({ role: "user", content });
-    const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt()));
+    const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt(number)));
     history.push({ role: "assistant", content: reply });
     if (paid) await extractAndApply(number, line, history);
     res.json({ reply, paid, reminders: reminders.filter((r) => r.number === number), tz: tzFor(number) });
@@ -518,7 +523,7 @@ app.post("/stripe/webhook", (req, res) => {
   }
   try {
     const o = event.data?.object || {};
-    const phone = normalizePhone(o.customer_details?.phone || o.metadata?.phone || o.phone || "");
+    const phone = normalizePhone(o.client_reference_id || o.customer_details?.phone || o.metadata?.phone || o.phone || "");
     const start = ["checkout.session.completed", "invoice.paid", "customer.subscription.created"];
     const end = ["customer.subscription.deleted", "invoice.payment_failed"];
     if (phone && phone !== "+") {
