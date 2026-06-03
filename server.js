@@ -548,6 +548,12 @@ app.get("/admin/status", (req, res) => {
   if (!adminOK(req)) return res.sendStatus(403);
   res.json({ paid: [...paidNumbers] });
 });
+// Force a re-sync from Stripe (handy for testing the source-of-truth flow).
+app.post("/admin/sync", async (req, res) => {
+  if (!adminOK(req)) return res.sendStatus(403);
+  await syncPaidFromStripe();
+  res.json({ ok: true, paid: [...paidNumbers] });
+});
 
 // Stripe webhook — flips a number to paid/unpaid when a subscription starts or
 // ends. Ready for when Stripe is configured (STRIPE_WEBHOOK_SECRET).
