@@ -48,12 +48,17 @@
     .logo { display: inline-flex; align-items: center; gap: 11px; }
     .logo .wordmark { font-size: clamp(20px, 2.4vh, 26px); font-weight: 700; letter-spacing: -0.02em; }
     .tag {
+      display: inline-flex; align-items: center; gap: 5px;
       font-size: 0.82rem; font-weight: 600; color: var(--fg);
       border: 1px solid var(--line); border-radius: 999px;
-      padding: 7px 14px; white-space: nowrap;
+      padding: 8px 15px; white-space: nowrap;
+      text-decoration: none; cursor: pointer;
+      transition: background .2s ease, color .2s ease, border-color .2s ease, transform .2s ease;
     }
+    .tag:hover { background: #0a0a0a; color: #fff; border-color: #0a0a0a; transform: translateY(-1px); }
     .tag b { font-weight: 700; }
     .tag span { color: var(--muted); font-weight: 500; }
+    .tag:hover span { color: rgba(255,255,255,0.7); }
 
     /* Two-column hero */
     .hero {
@@ -64,6 +69,11 @@
     }
 
     /* Left copy */
+    .eyebrow {
+      font-size: 0.78rem; font-weight: 600; letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--muted);
+      margin-bottom: clamp(8px, 1.4vh, 14px);
+    }
     h1 {
       font-family: 'Instrument Serif', Georgia, serif;
       font-weight: 400;
@@ -176,11 +186,12 @@
         </svg>
         <span class="wordmark">Rehearse</span>
       </span>
-      <span class="tag"><b>$29.99/mo</b> <span>· unlimited</span></span>
+      <a class="tag" href="https://buy.stripe.com/3cIeVdgvRae94Wx7eD1RC00"><b>$29.99/mo</b> <span>· unlimited</span></a>
     </div>
 
     <div class="hero">
       <div class="copy">
+        <p class="eyebrow">AI Interview Coach</p>
         <h1>Walk in <em>ready</em> for any interview.</h1>
         <p class="sub">A professional AI interview coach that lives in your messages — realistic mock interviews, instant feedback, and prep that texts you when it matters.</p>
 

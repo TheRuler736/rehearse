@@ -12,6 +12,7 @@ const {
   GROQ_MODEL = "llama-3.1-8b-instant",
   DEFAULT_TZ = "America/Los_Angeles", // used until a user tells the coach their timezone
   ADMIN_KEY, // guards /admin/* (falls back to SENDBLUE_API_SECRET)
+  STRIPE_SECRET_KEY, // lets the server ask Stripe who's actually subscribed
   STRIPE_WEBHOOK_SECRET, // set once Stripe is wired up; verifies webhook signatures
   SUBSCRIBE_URL = "https://rehearse-143f.onrender.com", // where unpaid users go to subscribe
   PRICE = "$29.99/month",
@@ -185,6 +186,45 @@ function normalizePhone(p) {
   const d = String(p).replace(/[^\d]/g, "");
   if (d.length === 10) return `+1${d}`;
   return `+${d}`;
+}
+
+/** Minimal Stripe REST helper (no SDK). */
+async function stripeApi(path, { method = "GET", body } = {}) {
+  if (!STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY not set");
+  const res = await fetch("https://api.stripe.com/v1/" + path, {
+    method,
+    headers: {
+      Authorization: "Bearer " + STRIPE_SECRET_KEY,
+      ...(body ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+    },
+    body,
+  });
+  const j = await res.json();
+  if (j.error) throw new Error(j.error.message);
+  return j;
+}
+
+/**
+ * Rebuild the paid list from Stripe (the source of truth). Runs on startup and
+ * periodically, so paid customers stay unlocked even after the server restarts.
+ * Relies on each customer's metadata.phone, which the webhook stamps at checkout.
+ */
+async function syncPaidFromStripe() {
+  if (!STRIPE_SECRET_KEY) return;
+  try {
+    const params = new URLSearchParams({ status: "active", limit: "100" });
+    params.append("expand[]", "data.customer");
+    const subs = await stripeApi("subscriptions?" + params.toString());
+    let n = 0;
+    for (const sub of subs.data || []) {
+      const c = sub.customer || {};
+      const phone = normalizePhone(c.metadata?.phone || c.phone || "");
+      if (phone && phone !== "+") { setPaid(phone, true); n++; }
+    }
+    console.log(`Stripe sync: ${n} active subscriber(s) loaded`);
+  } catch (err) {
+    console.warn("Stripe sync failed:", err.message);
+  }
 }
 
 /** Verify a Stripe webhook signature (so we don't need the Stripe SDK). */
@@ -527,8 +567,17 @@ app.post("/stripe/webhook", (req, res) => {
     const start = ["checkout.session.completed", "invoice.paid", "customer.subscription.created"];
     const end = ["customer.subscription.deleted", "invoice.payment_failed"];
     if (phone && phone !== "+") {
-      if (start.includes(event.type)) { setPaid(phone, true); console.log("✅ subscribed:", phone); }
-      else if (end.includes(event.type)) { setPaid(phone, false); console.log("⛔ unsubscribed:", phone); }
+      if (start.includes(event.type)) {
+        setPaid(phone, true);
+        console.log("✅ subscribed:", phone);
+        // Stamp the phone on the Stripe customer so restarts can re-sync from Stripe.
+        if (o.customer && STRIPE_SECRET_KEY) {
+          stripeApi("customers/" + o.customer, { method: "POST", body: new URLSearchParams({ "metadata[phone]": phone }).toString() }).catch(() => {});
+        }
+      } else if (end.includes(event.type)) {
+        setPaid(phone, false);
+        console.log("⛔ unsubscribed:", phone);
+      }
     }
   } catch (err) {
     console.error("stripe handler error:", err.message);
@@ -555,6 +604,7 @@ app.listen(PORT, () => {
   console.log(`Rehearse running on port ${PORT}`);
   console.log(`Model: ${GROQ_MODEL} via Groq`);
   console.log(`Webhook: POST /webhook/sendblue   Test: POST /test   Tick: ALL /cron/tick`);
+  syncPaidFromStripe(); // load current subscribers from Stripe on boot
 });
 
 /**
@@ -568,5 +618,6 @@ const SELF_URL = process.env.RENDER_EXTERNAL_URL;
 const TICK_MS = 5 * 60 * 1000;
 setInterval(async () => {
   try { await runDueReminders(); } catch (err) { console.error("scheduler tick error:", err.message); }
+  try { await syncPaidFromStripe(); } catch (err) { console.error("stripe sync tick error:", err.message); }
   if (SELF_URL) { try { await fetch(`${SELF_URL}/health`); } catch { /* ignore */ } }
 }, TICK_MS);
