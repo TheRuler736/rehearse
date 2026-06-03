@@ -597,7 +597,12 @@ app.post("/admin/revoke", (req, res) => {
 });
 app.get("/admin/status", (req, res) => {
   if (!adminOK(req)) return res.sendStatus(403);
-  res.json({ paid: [...paidNumbers] });
+  res.json({
+    paid: [...paidNumbers],
+    stripeKeyConfigured: !!STRIPE_SECRET_KEY,
+    webhookSecretConfigured: !!STRIPE_WEBHOOK_SECRET,
+    subscribeUrl: SUBSCRIBE_URL,
+  });
 });
 // Force a re-sync from Stripe (handy for testing the source-of-truth flow).
 app.post("/admin/sync", async (req, res) => {
