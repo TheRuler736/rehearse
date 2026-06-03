@@ -16,6 +16,7 @@ const {
   STRIPE_WEBHOOK_SECRET, // set once Stripe is wired up; verifies webhook signatures
   SUBSCRIBE_URL = "https://rehearse-143f.onrender.com", // where unpaid users go to subscribe
   PRICE = "$29.99/month",
+  LEAD_TTL_HOURS = "24", // delete an unpaid lead's Sendblue contact after this much inactivity
   PORT = 3000,
 } = process.env;
 
@@ -316,6 +317,55 @@ async function sbNotify(path, number, fromNumber) {
 }
 
 // ---------------------------------------------------------------------------
+// Contact lifecycle: verify subscribers (so we can text them) and prune unpaid
+// leads (free-plan contact slots are limited).
+// ---------------------------------------------------------------------------
+
+const lastSeen = new Map(); // number -> last inbound timestamp (ms)
+const LEAD_TTL_MS = (Number(LEAD_TTL_HOURS) || 24) * 3600e3;
+
+/** Verify a Sendblue contact so proactive messages can reach them. Best-effort. */
+async function verifyContact(number) {
+  try {
+    const res = await fetch("https://api.sendblue.co/api/v2/contacts/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "sb-api-key-id": SENDBLUE_API_KEY, "sb-api-secret-key": SENDBLUE_API_SECRET },
+      body: JSON.stringify({ number }),
+    });
+    if (!res.ok) console.warn(`verify ${res.status}: ${(await res.text()).slice(0, 160)}`);
+    else console.log("✔ verified contact:", number);
+  } catch (err) {
+    console.warn("verify error:", err.message);
+  }
+}
+
+/** Delete a Sendblue contact (frees a slot on the free plan). Best-effort. */
+async function deleteContact(number) {
+  try {
+    const res = await fetch(`https://api.sendblue.co/api/v2/contacts/${encodeURIComponent(number)}`, {
+      method: "DELETE",
+      headers: { "sb-api-key-id": SENDBLUE_API_KEY, "sb-api-secret-key": SENDBLUE_API_SECRET },
+    });
+    if (!res.ok && res.status !== 404) console.warn(`delete contact ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  } catch (err) {
+    console.warn("delete contact error:", err.message);
+  }
+}
+
+/** Remove unpaid leads that have gone quiet, so their contact slot is freed. */
+async function cleanupStaleLeads() {
+  const now = Date.now();
+  for (const [number, ts] of lastSeen) {
+    if (isPaid(number)) continue;         // never remove paying customers
+    if (now - ts < LEAD_TTL_MS) continue; // still within the conversion window
+    await deleteContact(number);
+    conversations.delete(number);
+    lastSeen.delete(number);
+    console.log("🧹 removed stale unpaid lead:", number);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Scheduling: parse the model's hidden [[...]] directives, store reminders, and
 // fire them on each /cron/tick (driven by an external heartbeat).
 // ---------------------------------------------------------------------------
@@ -466,6 +516,7 @@ app.post("/webhook/sendblue", async (req, res) => {
     if (is_outbound || !content || !from_number) return;
 
     console.log(`← ${from_number}: ${content}`);
+    lastSeen.set(from_number, Date.now()); // track activity for lead cleanup
 
     // Which of our lines received this? Reply from that same line.
     const line = req.body.to_number || req.body.number || SENDBLUE_FROM_NUMBER;
@@ -576,6 +627,7 @@ app.post("/stripe/webhook", (req, res) => {
       if (start.includes(event.type)) {
         setPaid(phone, true);
         console.log("✅ subscribed:", phone);
+        verifyContact(phone); // make sure we can text them (reminders, etc.)
         // Stamp the phone on the Stripe customer so restarts can re-sync from Stripe.
         if (o.customer && STRIPE_SECRET_KEY) {
           stripeApi("customers/" + o.customer, { method: "POST", body: new URLSearchParams({ "metadata[phone]": phone }).toString() }).catch(() => {});
@@ -625,5 +677,6 @@ const TICK_MS = 5 * 60 * 1000;
 setInterval(async () => {
   try { await runDueReminders(); } catch (err) { console.error("scheduler tick error:", err.message); }
   try { await syncPaidFromStripe(); } catch (err) { console.error("stripe sync tick error:", err.message); }
+  try { await cleanupStaleLeads(); } catch (err) { console.error("lead cleanup tick error:", err.message); }
   if (SELF_URL) { try { await fetch(`${SELF_URL}/health`); } catch { /* ignore */ } }
 }, TICK_MS);
