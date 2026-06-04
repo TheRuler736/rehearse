@@ -409,8 +409,11 @@ async function sbNotify(path, number, fromNumber) {
 // leads (free-plan contact slots are limited).
 // ---------------------------------------------------------------------------
 
-const lastSeen = new Map(); // number -> last inbound timestamp (ms)
+const lastSeen = new Map();       // number -> last inbound timestamp (ms)
+const leadLine = new Map();       // number -> Sendblue line that received their texts
+const finalPitchSent = new Set(); // numbers we've sent the single win-back to
 const LEAD_TTL_MS = (Number(LEAD_TTL_HOURS) || 24) * 3600e3;
+const WINBACK_MS = (Number(process.env.WINBACK_MINUTES) || 30) * 60000;
 
 /** Verify a Sendblue contact so proactive messages can reach them. Best-effort. */
 async function verifyContact(number) {
@@ -449,7 +452,46 @@ async function cleanupStaleLeads() {
     await deleteContact(number);
     conversations.delete(number);
     lastSeen.delete(number);
+    leadLine.delete(number);
+    finalPitchSent.delete(number);
     console.log("🧹 removed stale unpaid lead:", number);
+  }
+}
+
+/** A warm, final win-back pitch for an unpaid lead who went quiet. */
+async function winBackMessage(number) {
+  // Build the personalized link in code (the model tends to drop query params).
+  const link = `${SUBSCRIBE_URL}${SUBSCRIBE_URL.includes("?") ? "&" : "?"}client_reference_id=${String(number).replace(/\D/g, "")}`;
+  const sys = `You are Rehearse, a professional AI interview coach. This person texted you earlier but didn't subscribe. Write ONE short, warm, confident final message (2-3 sentences) that gently wins them back: remind them what they're missing (realistic mock interviews, instant feedback, prep reminders before the real thing), note it's ${PRICE}, unlimited, cancel anytime, and invite them to start. Reference their situation if the conversation shows it. Do NOT include any link or URL — one is appended automatically. Plain text only, no markdown.`;
+  let msg;
+  try {
+    const convo = getHistory(number).slice(-6).map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.content}`).join("\n");
+    msg = await askModel([{ role: "user", content: `Earlier conversation:\n${convo || "(brief)"}\n\nWrite the final win-back message now.` }], sys, { temperature: 0.7, maxTokens: 160 });
+  } catch {
+    msg = `Still on the fence? Rehearse is your AI interview coach right in your texts — unlimited mock interviews, instant feedback, and reminders before the real thing. ${PRICE}, cancel anytime.`;
+  }
+  return `${msg.trim()}\n\n${link}`;
+}
+
+/** Send the single final win-back to unpaid leads who went quiet ~30 min ago. */
+async function sendWinBacks() {
+  const now = Date.now();
+  for (const [number, ts] of lastSeen) {
+    if (isPaid(number)) continue;             // they bought
+    if (customerId.has(number)) continue;     // existing/former Stripe customer — don't pitch
+    if (finalPitchSent.has(number)) continue; // only ever send one
+    if (now - ts < WINBACK_MS) continue;      // not quiet long enough yet
+    finalPitchSent.add(number);
+    try {
+      const line = leadLine.get(number) || SENDBLUE_FROM_NUMBER;
+      const msg = await winBackMessage(number);
+      await sbNotify("send-typing-indicator", number, line);
+      await sendText(number, msg, line);
+      getHistory(number).push({ role: "assistant", content: msg });
+      console.log(`🪝 win-back → ${number}`);
+    } catch (err) {
+      console.warn("win-back error:", err.message);
+    }
   }
 }
 
@@ -623,6 +665,7 @@ app.post("/webhook/sendblue", async (req, res) => {
 
     // Which of our lines received this? Reply from that same line.
     const line = req.body.to_number || req.body.number || SENDBLUE_FROM_NUMBER;
+    leadLine.set(from_number, line); // remember the line for proactive win-backs
 
     // Mark their message "Read" and show the typing "…" bubble while we think.
     await sbNotify("mark-read", from_number, line);
@@ -811,6 +854,7 @@ const TICK_MS = 5 * 60 * 1000;
 setInterval(async () => {
   try { await runDueReminders(); } catch (err) { console.error("scheduler tick error:", err.message); }
   try { await syncPaidFromStripe(); } catch (err) { console.error("stripe sync tick error:", err.message); }
+  try { await sendWinBacks(); } catch (err) { console.error("win-back tick error:", err.message); }
   try { await cleanupStaleLeads(); } catch (err) { console.error("lead cleanup tick error:", err.message); }
   if (SELF_URL) { try { await fetch(`${SELF_URL}/health`); } catch { /* ignore */ } }
 }, TICK_MS);
