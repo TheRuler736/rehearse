@@ -170,13 +170,15 @@
     /* Hide sub on shorter screens so it always fits */
     @media (max-height: 720px) { .sub { display: none; } }
 
-    /* Legal footer — fixed so it never affects the centered, no-scroll layout */
+    /* Legal links — kept in the normal content flow so they're always tappable.
+       (A fixed-bottom footer gets hidden behind iOS Safari's toolbar.) */
     .legal {
-      position: fixed; left: 0; right: 0; bottom: clamp(8px, 1.6vh, 16px);
-      text-align: center; font-size: 0.76rem; color: #9a9a9a; z-index: 3;
+      text-align: center;
+      margin-top: clamp(16px, 3vh, 30px);
+      font-size: 0.8rem; color: #9a9a9a;
     }
-    .legal a { color: #9a9a9a; text-decoration: none; }
-    .legal a:hover { color: #0a0a0a; }
+    .legal a { color: #9a9a9a; text-decoration: none; padding: 6px 8px; display: inline-block; }
+    .legal a:hover { color: #0a0a0a; text-decoration: underline; }
 
     @media (prefers-reduced-motion: reduce) {
       main, .bubble { animation: none; }
@@ -227,10 +229,10 @@
         <div class="bubble received">Strong example. Add the outcome next time — and I'll text you a reminder the night before your interview.</div>
       </div>
     </div>
-  </main>
 
-  <div class="legal">
-    <a href="/terms">Terms</a> &nbsp;·&nbsp; <a href="/privacy">Privacy</a>
-  </div>
+    <div class="legal">
+      <a href="/terms">Terms</a> &nbsp;·&nbsp; <a href="/privacy">Privacy</a>
+    </div>
+  </main>
 </body>
 </html>
