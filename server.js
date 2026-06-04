@@ -9,7 +9,8 @@ const {
   SENDBLUE_API_SECRET,
   SENDBLUE_FROM_NUMBER, // optional: your Sendblue line to send from (e.g. +1...)
   GROQ_API_KEY,
-  GROQ_MODEL = "llama-3.1-8b-instant",
+  GROQ_MODEL = "llama-3.1-8b-instant", // sales + background tasks (cheap/fast)
+  PAID_MODEL = "llama-3.3-70b-versatile", // the actual coaching for subscribers (higher quality)
   DEFAULT_TZ = "America/Los_Angeles", // used until a user tells the coach their timezone
   ADMIN_KEY, // guards /admin/* (falls back to SENDBLUE_API_SECRET)
   STRIPE_SECRET_KEY, // lets the server ask Stripe who's actually subscribed
@@ -75,6 +76,7 @@ STRICT RULES (do not break these):
 - Do NOT run a mock interview, ask practice interview questions, evaluate answers, or give interview tips/feedback. That is for subscribers only.
 - If they ask you to practice or coach them, warmly acknowledge it and explain that full coaching is included with a Rehearse subscription, then invite them to start.
 - Keep replies short (1-3 sentences), polished, warm, and professional. Plain text only.
+- Do NOT invent or promise a free trial, discount, or refund. The ONLY offer is the ${PRICE} subscription (cancel anytime).
 
 WHAT TO CONVEY over the conversation (naturally, not all at once):
 - Rehearse is a professional AI interview coach that lives in your texts: realistic mock interviews for any company or role, instant specific feedback, proactive reminders before your real interview, and daily practice questions.
@@ -351,7 +353,7 @@ function verifyStripe(rawBody, sigHeader, secret) {
 }
 
 /** Call Groq (OpenAI-compatible) with the running history; return the reply text. */
-async function askModel(history, systemPrompt, { temperature = 0.8, maxTokens = 300 } = {}) {
+async function askModel(history, systemPrompt, { temperature = 0.8, maxTokens = 300, model = GROQ_MODEL } = {}) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -359,7 +361,7 @@ async function askModel(history, systemPrompt, { temperature = 0.8, maxTokens = 
       Authorization: `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model,
       messages: [{ role: "system", content: systemPrompt }, ...history],
       temperature,
       max_tokens: maxTokens,
@@ -620,7 +622,8 @@ async function generateDailyQuestion(context) {
   try {
     const q = await askModel(
       [{ role: "user", content: `Give me ONE concise ${context} interview question to practice today. Output only the question.` }],
-      "You are an interview coach. Reply with a single short interview question in plain text, no preamble."
+      "You are an interview coach. Reply with a single short interview question in plain text, no preamble.",
+      { model: PAID_MODEL } // daily questions are a paid feature — use the better model
     );
     return `Morning! ☀️ Daily practice — ${q}`;
   } catch {
@@ -735,7 +738,7 @@ app.post("/webhook/sendblue", async (req, res) => {
     }
 
     const systemPrompt = paid ? buildSystemPrompt(from_number) : buildSalesPrompt(from_number);
-    const reply = stripDirectives(await askModel(history, systemPrompt));
+    const reply = stripDirectives(await askModel(history, systemPrompt, paid ? { model: PAID_MODEL } : {}));
     history.push({ role: "assistant", content: reply });
 
     // Trim old turns to cap memory use.
@@ -779,7 +782,7 @@ app.post("/test", async (req, res) => {
       history.push({ role: "assistant", content: reply });
       return res.json({ reply, paid, billing: true });
     }
-    const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt(number)));
+    const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt(number), paid ? { model: PAID_MODEL } : {}));
     history.push({ role: "assistant", content: reply });
     if (paid) await extractAndApply(number, line, history);
     res.json({ reply, paid, reminders: reminders.filter((r) => r.number === number), tz: tzFor(number) });
