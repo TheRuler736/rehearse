@@ -45,7 +45,12 @@
     .cta:hover svg { transform:translateX(4px); }
     .num { margin-top:clamp(16px,2.6vh,22px); color:var(--muted); font-size:clamp(0.92rem,1.9vh,1rem); }
     .num b { color:var(--fg); font-weight:600; }
-    .hint { margin-top:clamp(20px,3vh,30px); color:#9a9a9a; font-size:0.86rem; line-height:1.5; max-width:36ch; margin-left:auto; margin-right:auto; }
+    /* Desktop-only QR: scan with phone camera → opens Messages pre-filled */
+    .qr { display:none; margin-top:clamp(20px,3.4vh,30px); }
+    .qr-card { display:inline-block; padding:12px; background:#fff; border:1px solid var(--line); border-radius:16px; box-shadow:0 8px 24px rgba(0,0,0,0.06); }
+    .qrimg { width:146px; height:146px; display:block; }
+    .qr-label { margin-top:12px; color:#9a9a9a; font-size:0.88rem; line-height:1.5; max-width:30ch; margin-left:auto; margin-right:auto; }
+    @media (min-width:700px) and (min-height:620px) { .qr { display:block; } }
     @media (prefers-reduced-motion: reduce) { main { animation:none; } .cta, .cta svg { transition:none; } }
   </style>
 </head>
@@ -64,7 +69,11 @@
     </a>
 
     <p class="num">Or text <b>+1 (347) 268-2624</b> any company or role to begin</p>
-    <p class="hint">On a computer? Open Messages on your phone and text the number above — that's where your coach lives.</p>
+
+    <div class="qr">
+      <div class="qr-card"><svg class="qrimg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 41 41" shape-rendering="crispEdges"><path fill="#ffffff" d="M0 0h41v41H0z"/><path stroke="#000000" d="M4 4.5h7m2 0h1m1 0h3m2 0h3m1 0h1m1 0h2m2 0h7M4 5.5h1m5 0h1m6 0h2m2 0h1m1 0h1m2 0h1m1 0h1m1 0h1m5 0h1M4 6.5h1m1 0h3m1 0h1m1 0h2m1 0h3m1 0h1m1 0h2m1 0h2m1 0h2m1 0h1m1 0h3m1 0h1M4 7.5h1m1 0h3m1 0h1m1 0h2m1 0h2m1 0h3m3 0h3m1 0h1m1 0h1m1 0h3m1 0h1M4 8.5h1m1 0h3m1 0h1m1 0h2m5 0h1m1 0h2m3 0h1m3 0h1m1 0h3m1 0h1M4 9.5h1m5 0h1m1 0h1m3 0h7m1 0h1m1 0h3m1 0h1m5 0h1M4 10.5h7m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h1m1 0h7M12 11.5h1m2 0h1m1 0h1m1 0h1m1 0h2m2 0h1M4 12.5h1m1 0h5m4 0h5m5 0h4m1 0h5M4 13.5h2m1 0h2m3 0h1m2 0h2m2 0h2m1 0h2m7 0h3m2 0h1M4 14.5h2m4 0h2m1 0h1m5 0h1m2 0h2m1 0h2m1 0h2m1 0h1m1 0h4M9 15.5h1m3 0h3m2 0h1m1 0h1m2 0h1m1 0h1m2 0h1m1 0h1m1 0h3M6 16.5h1m1 0h1m1 0h2m1 0h2m7 0h2m1 0h1m1 0h1m1 0h3m1 0h1m1 0h1M8 17.5h1m5 0h2m2 0h3m3 0h1m5 0h1m1 0h1m3 0h1M4 18.5h1m2 0h2m1 0h1m1 0h1m3 0h1m1 0h1m2 0h3m1 0h5m1 0h2m1 0h2M4 19.5h3m1 0h2m2 0h2m1 0h4m1 0h5m2 0h2m1 0h2m1 0h4M4 20.5h1m2 0h1m2 0h1m1 0h1m1 0h1m3 0h1m1 0h1m2 0h4m1 0h1m1 0h3m1 0h1M5 21.5h1m6 0h2m1 0h1m1 0h1m1 0h6m3 0h4m2 0h1m1 0h1M5 22.5h1m3 0h2m1 0h1m8 0h1m4 0h1m3 0h2m1 0h1m1 0h2M4 23.5h2m2 0h2m2 0h1m1 0h1m1 0h1m1 0h2m1 0h3m3 0h2m2 0h1m2 0h1m1 0h1M5 24.5h1m4 0h2m1 0h1m2 0h1m1 0h1m1 0h1m3 0h3m2 0h3m1 0h1M4 25.5h3m1 0h2m1 0h1m2 0h2m1 0h3m1 0h2m2 0h1m3 0h1m2 0h1m1 0h3M4 26.5h1m1 0h3m1 0h1m2 0h1m1 0h3m1 0h2m1 0h1m1 0h6m1 0h1m2 0h2M4 27.5h1m1 0h4m1 0h1m3 0h1m1 0h3m1 0h2m4 0h1m1 0h1m3 0h1m1 0h1M4 28.5h1m5 0h1m2 0h4m2 0h1m1 0h1m2 0h3m1 0h5m2 0h1M12 29.5h1m4 0h1m2 0h1m2 0h4m1 0h1m3 0h1M4 30.5h7m2 0h3m2 0h1m3 0h2m1 0h1m1 0h2m1 0h1m1 0h1m2 0h2M4 31.5h1m5 0h1m1 0h1m1 0h1m2 0h1m1 0h1m5 0h2m1 0h1m3 0h1m1 0h1M4 32.5h1m1 0h3m1 0h1m1 0h1m1 0h1m4 0h1m2 0h2m1 0h1m1 0h6m3 0h1M4 33.5h1m1 0h3m1 0h1m1 0h2m1 0h2m1 0h3m3 0h1m1 0h2m2 0h1m3 0h1M4 34.5h1m1 0h3m1 0h1m1 0h1m3 0h3m2 0h3m2 0h1m1 0h4m2 0h1M4 35.5h1m5 0h1m3 0h1m1 0h1m1 0h1m1 0h1m1 0h3m3 0h1m3 0h2M4 36.5h7m1 0h1m1 0h1m2 0h1m5 0h1m1 0h3m2 0h3m2 0h1"/></svg></div>
+      <p class="qr-label">On a computer? Scan this with your phone's camera to text us.</p>
+    </div>
   </main>
 </body>
 </html>
