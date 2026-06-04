@@ -606,6 +606,22 @@ async function extractAndApply(number, line, history) {
   }
 }
 
+/** Welcome a brand-new subscriber so they don't have to figure out the next step. */
+async function sendWelcome(number) {
+  if (optedOut.has(number)) return;
+  const line = leadLine.get(number) || SENDBLUE_FROM_NUMBER;
+  const msg = "Welcome to Rehearse 🎉 You're all set. Text me any company or role — like \"Amazon\" or \"product manager\" — and I'll start your first mock interview. Want a reminder before your real interview? Just tell me the date.";
+  try {
+    await sendText(number, msg, line);
+    getHistory(number).push({ role: "assistant", content: msg });
+    console.log("👋 welcome →", number);
+  } catch (err) {
+    // Expected for pay-first buyers who never texted in (unverified) — the
+    // Stripe success page covers them instead.
+    console.warn("welcome send skipped:", err.message);
+  }
+}
+
 /** Send a proactive (coach-initiated) text and record it in the conversation. */
 async function deliverProactive(r, message) {
   if (optedOut.has(r.number)) return; // never message someone who opted out
@@ -852,6 +868,7 @@ app.post("/stripe/webhook", (req, res) => {
     const end = ["customer.subscription.deleted"];
     if (phone && phone !== "+") {
       if (start.includes(event.type)) {
+        const isNew = !isPaid(phone);
         setPaid(phone, true);
         if (o.customer) customerId.set(phone, o.customer);
         console.log("✅ subscribed:", phone);
@@ -860,6 +877,8 @@ app.post("/stripe/webhook", (req, res) => {
         if (o.customer && STRIPE_SECRET_KEY) {
           stripeApi("customers/" + o.customer, { method: "POST", body: new URLSearchParams({ "metadata[phone]": phone }).toString() }).catch(() => {});
         }
+        // Welcome them once, only on the initial checkout (not on monthly renewals).
+        if (event.type === "checkout.session.completed" && isNew) sendWelcome(phone);
       } else if (end.includes(event.type)) {
         manualGrants.delete(phone);
         setPaid(phone, false);
