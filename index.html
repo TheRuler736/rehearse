@@ -170,6 +170,14 @@
     /* Hide sub on shorter screens so it always fits */
     @media (max-height: 720px) { .sub { display: none; } }
 
+    /* Legal footer — fixed so it never affects the centered, no-scroll layout */
+    .legal {
+      position: fixed; left: 0; right: 0; bottom: clamp(8px, 1.6vh, 16px);
+      text-align: center; font-size: 0.76rem; color: #9a9a9a; z-index: 3;
+    }
+    .legal a { color: #9a9a9a; text-decoration: none; }
+    .legal a:hover { color: #0a0a0a; }
+
     @media (prefers-reduced-motion: reduce) {
       main, .bubble { animation: none; }
       .cta, .cta svg { transition: none; }
@@ -220,5 +228,9 @@
       </div>
     </div>
   </main>
+
+  <div class="legal">
+    <a href="/terms">Terms</a> &nbsp;·&nbsp; <a href="/privacy">Privacy</a>
+  </div>
 </body>
 </html>

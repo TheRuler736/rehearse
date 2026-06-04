@@ -32,7 +32,7 @@ const app = express();
 // route as raw and everything else as JSON.
 app.use("/stripe/webhook", express.raw({ type: "*/*" }));
 app.use((req, res, next) => (req.originalUrl === "/stripe/webhook" ? next() : express.json()(req, res, next)));
-app.use(express.static(".")); // serves index.html (the landing page)
+app.use(express.static(".", { extensions: ["html"] })); // serves index.html + /terms, /privacy
 
 /**
  * The coach's personality + rules. Tuned for texting: short, one question at a
@@ -293,6 +293,27 @@ async function lazyStripeCheck(number) {
     console.warn("lazy check:", err.message);
   }
   return false;
+}
+
+const SITE_URL = process.env.RENDER_EXTERNAL_URL || "https://rehearse-143f.onrender.com";
+
+/** Does this message look like a billing / cancellation request (not "cancel reminders")? */
+function cancelIntent(text) {
+  return /\b(unsubscribe|cancel\s+(my\s+)?(subscription|membership|plan|account|billing)|manage\s+(my\s+)?(subscription|billing|plan|account)|stop\s+(my\s+)?(subscription|membership)|update\s+(my\s+)?(card|payment)|refund|billing\s+(help|issue|portal|question))\b/i.test(text || "");
+}
+
+/** Create a Stripe Customer Portal link so a subscriber can manage/cancel themselves. */
+async function billingPortalUrl(number) {
+  const cid = customerId.get(number);
+  if (!cid || !STRIPE_SECRET_KEY) return null;
+  try {
+    const body = new URLSearchParams({ customer: cid, return_url: SITE_URL });
+    const session = await stripeApi("billing_portal/sessions", { method: "POST", body: body.toString() });
+    return session.url || null;
+  } catch (err) {
+    console.warn("portal session:", err.message);
+    return null;
+  }
 }
 
 /** Verify a Stripe webhook signature (so we don't need the Stripe SDK). */
@@ -613,6 +634,18 @@ app.post("/webhook/sendblue", async (req, res) => {
     const history = getHistory(from_number);
     history.push({ role: "user", content });
 
+    // Billing/cancellation requests from subscribers get a self-serve Stripe portal link.
+    if (paid && cancelIntent(content)) {
+      const url = await billingPortalUrl(from_number);
+      const reply = url
+        ? `You can manage or cancel your subscription anytime here:\n${url}`
+        : `I can help with that — please email niah@changeist.org and we'll take care of it.`;
+      history.push({ role: "assistant", content: reply });
+      await sendText(from_number, reply, line);
+      console.log(`→ ${from_number} (billing portal)`);
+      return;
+    }
+
     const systemPrompt = paid ? buildSystemPrompt(from_number) : buildSalesPrompt(from_number);
     const reply = stripDirectives(await askModel(history, systemPrompt));
     history.push({ role: "assistant", content: reply });
@@ -648,6 +681,12 @@ app.post("/test", async (req, res) => {
     const paid = paidFlag !== undefined ? !!paidFlag : (isPaid(number) || await lazyStripeCheck(number));
     const history = getHistory(number);
     history.push({ role: "user", content });
+    if (paid && cancelIntent(content)) {
+      const url = await billingPortalUrl(number);
+      const reply = url ? `Manage or cancel here: ${url}` : `Contact support to manage your subscription.`;
+      history.push({ role: "assistant", content: reply });
+      return res.json({ reply, paid, billing: true });
+    }
     const reply = stripDirectives(await askModel(history, paid ? buildSystemPrompt(number) : buildSalesPrompt(number)));
     history.push({ role: "assistant", content: reply });
     if (paid) await extractAndApply(number, line, history);
