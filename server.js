@@ -18,6 +18,7 @@ const {
   SUBSCRIBE_URL = "https://rehearse-143f.onrender.com", // where unpaid users go to subscribe
   PRICE = "$29.99/month",
   LEAD_TTL_HOURS = "24", // delete an unpaid lead's Sendblue contact after this much inactivity
+  CONTACT_EMAIL, // where contact-form submissions are emailed (kept out of the public site/repo)
   PORT = 3000,
 } = process.env;
 
@@ -310,7 +311,7 @@ function cancelIntent(text) {
 // ---- Compliance: STOP / START / HELP keyword handling -------------------------
 const STOP_CONFIRM = "You're unsubscribed and won't receive more messages from Rehearse. Reply START anytime to resume.";
 const START_CONFIRM = "You're resubscribed — welcome back. Text a company or role to practice anytime.";
-const HELP_REPLY = `Rehearse — your AI interview coach over text (${PRICE}). Reply START to resume, STOP to opt out. Questions: niah@changeist.org`;
+const HELP_REPLY = `Rehearse — your AI interview coach over text (${PRICE}). Reply START to resume, STOP to opt out. Questions? rehearse-143f.onrender.com/contact`;
 
 function optOutIntent(text) {
   const t = (text || "").trim().toLowerCase();
@@ -746,7 +747,7 @@ app.post("/webhook/sendblue", async (req, res) => {
       const url = await billingPortalUrl(from_number);
       const reply = url
         ? `You can manage or cancel your subscription anytime here:\n${url}`
-        : `I can help with that — please email niah@changeist.org and we'll take care of it.`;
+        : `I can help with that — reach us at rehearse-143f.onrender.com/contact and we'll take care of it.`;
       history.push({ role: "assistant", content: reply });
       await sendText(from_number, reply, line);
       console.log(`→ ${from_number} (billing portal)`);
@@ -808,6 +809,48 @@ app.post("/test", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Contact form — emails submissions to CONTACT_EMAIL via a no-account relay
+// (FormSubmit), and keeps a small in-memory backup retrievable at /admin/messages.
+// ---------------------------------------------------------------------------
+const contactMessages = [];
+let lastContactAt = 0;
+
+app.post("/contact", async (req, res) => {
+  const { name = "", email = "", message = "", website = "" } = req.body || {};
+  if (website) return res.json({ ok: true }); // honeypot — silently drop bots
+  if (!String(message).trim()) return res.status(400).json({ error: "message required" });
+  if (Date.now() - lastContactAt < 2000) return res.status(429).json({ error: "slow down" });
+  lastContactAt = Date.now();
+
+  const entry = {
+    at: new Date().toISOString(),
+    name: String(name).slice(0, 80),
+    email: String(email).slice(0, 120),
+    message: String(message).slice(0, 2000),
+  };
+  contactMessages.unshift(entry);
+  if (contactMessages.length > 50) contactMessages.length = 50;
+  console.log("📨 contact from", entry.email || "(no email)");
+
+  // Email it (no account needed; the first submission triggers a one-time
+  // activation click from FormSubmit to your inbox).
+  if (CONTACT_EMAIL) {
+    fetch("https://formsubmit.co/ajax/" + encodeURIComponent(CONTACT_EMAIL), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        _subject: "New Rehearse contact message",
+        name: entry.name || "(no name)",
+        email: entry.email || "(no email provided)",
+        _replyto: entry.email || undefined,
+        message: entry.message,
+      }),
+    }).catch((e) => console.warn("contact email failed:", e.message));
+  }
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
 // Subscription endpoints
 // ---------------------------------------------------------------------------
 
@@ -845,6 +888,11 @@ app.post("/admin/sync", async (req, res) => {
   if (!adminOK(req)) return res.sendStatus(403);
   await syncPaidFromStripe();
   res.json({ ok: true, paid: [...paidNumbers] });
+});
+// Backup of recent contact-form submissions (in case email delivery ever fails).
+app.get("/admin/messages", (req, res) => {
+  if (!adminOK(req)) return res.sendStatus(403);
+  res.json({ messages: contactMessages });
 });
 
 // Stripe webhook — flips a number to paid/unpaid when a subscription starts or
