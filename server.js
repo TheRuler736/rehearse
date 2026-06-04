@@ -51,7 +51,7 @@ HOW A SESSION WORKS:
 - Ask ONE question at a time and wait for their answer.
 - After each answer, give brief, specific, professional feedback (what was strong + one concrete improvement), then ask the next question.
 - Mix behavioral and role-relevant questions appropriate to the company/role.
-- If they say "stop", "new", "restart", or name a different company, switch gracefully.
+- If they say "new", "restart", or name a different company, switch gracefully.
 - If the first message is vague (e.g. "hi"), greet them professionally and ask which company or role they'd like to practice for.
 
 Maintain a focused, momentum-building session that measurably improves their answers.`;
@@ -181,6 +181,7 @@ const paidNumbers = new Set();   // everyone with access now (Stripe-active ∪ 
 const manualGrants = new Set();  // admin grants, not backed by Stripe (survive authoritative sync)
 const customerId = new Map();    // phone -> Stripe customer id (to persist per-user state)
 const lazyChecked = new Map();   // phone -> last Stripe lookup ts (negative cache)
+const optedOut = new Set();      // numbers who texted STOP — never message them until START
 let stateLoaded = false;         // have we rehydrated reminders from Stripe yet?
 
 function isPaid(number) { return paidNumbers.has(number); }
@@ -239,6 +240,7 @@ async function syncPaidFromStripe() {
       customerId.set(phone, c.id);
       if (!stateLoaded) {
         if (c.metadata?.tz && isValidTz(c.metadata.tz)) timezones.set(phone, c.metadata.tz);
+        if (c.metadata?.optedOut === "1") optedOut.add(phone);
         if (c.metadata?.reminders) {
           try { for (const r of JSON.parse(c.metadata.reminders)) rehydrateReminder(r); } catch { /* ignore bad blob */ }
         }
@@ -265,6 +267,7 @@ async function saveCustomerState(number) {
   const body = new URLSearchParams();
   body.set("metadata[reminders]", blob);
   body.set("metadata[tz]", tzFor(number));
+  body.set("metadata[optedOut]", optedOut.has(number) ? "1" : "");
   stripeApi("customers/" + cid, { method: "POST", body: body.toString() }).catch((e) => console.warn("save state:", e.message));
 }
 
@@ -300,6 +303,25 @@ const SITE_URL = process.env.RENDER_EXTERNAL_URL || "https://rehearse-143f.onren
 /** Does this message look like a billing / cancellation request (not "cancel reminders")? */
 function cancelIntent(text) {
   return /\b(unsubscribe|cancel\s+(my\s+)?(subscription|membership|plan|account|billing)|manage\s+(my\s+)?(subscription|billing|plan|account)|stop\s+(my\s+)?(subscription|membership)|update\s+(my\s+)?(card|payment)|refund|billing\s+(help|issue|portal|question))\b/i.test(text || "");
+}
+
+// ---- Compliance: STOP / START / HELP keyword handling -------------------------
+const STOP_CONFIRM = "You're unsubscribed and won't receive more messages from Rehearse. Reply START anytime to resume.";
+const START_CONFIRM = "You're resubscribed — welcome back. Text a company or role to practice anytime.";
+const HELP_REPLY = `Rehearse — your AI interview coach over text (${PRICE}). Reply START to resume, STOP to opt out. Questions: niah@changeist.org`;
+
+function optOutIntent(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (["stop", "stopall", "stop all", "unsubscribe", "unsubscribe me", "optout", "opt out", "opt-out"].includes(t)) return true;
+  return /\b(stop\s+(texting|messaging|contacting)(\s+me)?|unsubscribe\s+me|remove\s+me|leave\s+me\s+alone|do\s*n'?t\s+(text|message|contact)\s+me|do not\s+(text|message|contact)\s+me)\b/i.test(text || "");
+}
+function resumeIntent(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (["start", "unstop", "resume", "opt in", "opt-in", "optin"].includes(t)) return true;
+  return /\b(start\s+(texting|messaging)|opt\s+back\s+in|re-?subscribe)\b/i.test(text || "");
+}
+function helpIntent(text) {
+  return ["help", "info"].includes((text || "").trim().toLowerCase());
 }
 
 /** Create a Stripe Customer Portal link so a subscriber can manage/cancel themselves. */
@@ -477,6 +499,7 @@ async function winBackMessage(number) {
 async function sendWinBacks() {
   const now = Date.now();
   for (const [number, ts] of lastSeen) {
+    if (optedOut.has(number)) continue;       // they opted out — never pitch
     if (isPaid(number)) continue;             // they bought
     if (customerId.has(number)) continue;     // existing/former Stripe customer — don't pitch
     if (finalPitchSent.has(number)) continue; // only ever send one
@@ -583,6 +606,7 @@ async function extractAndApply(number, line, history) {
 
 /** Send a proactive (coach-initiated) text and record it in the conversation. */
 async function deliverProactive(r, message) {
+  if (optedOut.has(r.number)) return; // never message someone who opted out
   await sbNotify("send-typing-indicator", r.number, r.line);
   await sendText(r.number, message, r.line);
   const h = getHistory(r.number);
@@ -660,12 +684,33 @@ app.post("/webhook/sendblue", async (req, res) => {
     if (is_outbound || !content || !from_number) return;
     if (rateLimited(from_number)) { console.warn("rate limited:", from_number); return; }
 
-    console.log(`← ${from_number} (${content.length} chars)`);
-    lastSeen.set(from_number, Date.now()); // track activity for lead cleanup
-
     // Which of our lines received this? Reply from that same line.
     const line = req.body.to_number || req.body.number || SENDBLUE_FROM_NUMBER;
-    leadLine.set(from_number, line); // remember the line for proactive win-backs
+
+    // Compliance first: honor STOP / START / HELP before any other handling.
+    if (optOutIntent(content)) {
+      optedOut.add(from_number);
+      if (customerId.has(from_number)) saveCustomerState(from_number); // persist for subscribers
+      await sendText(from_number, STOP_CONFIRM, line);
+      console.log(`⛔ opt-out: ${from_number}`);
+      return;
+    }
+    if (resumeIntent(content)) {
+      optedOut.delete(from_number);
+      if (customerId.has(from_number)) saveCustomerState(from_number);
+      await sendText(from_number, START_CONFIRM, line);
+      console.log(`▶ opt-in: ${from_number}`);
+      return;
+    }
+    if (optedOut.has(from_number)) {
+      if (helpIntent(content)) await sendText(from_number, HELP_REPLY, line);
+      return; // opted out → stay silent
+    }
+    if (helpIntent(content)) { await sendText(from_number, HELP_REPLY, line); return; }
+
+    console.log(`← ${from_number} (${content.length} chars)`);
+    lastSeen.set(from_number, Date.now()); // track activity for lead cleanup
+    leadLine.set(from_number, line);       // remember the line for proactive win-backs
 
     // Mark their message "Read" and show the typing "…" bubble while we think.
     await sbNotify("mark-read", from_number, line);
@@ -721,6 +766,10 @@ app.post("/test", async (req, res) => {
   try {
     const { number = "+10000000000", content, line, paid: paidFlag } = req.body || {};
     if (!content) return res.status(400).json({ error: "content required" });
+    // Mirror the webhook's compliance handling so it can be tested.
+    if (optOutIntent(content)) { optedOut.add(number); if (customerId.has(number)) saveCustomerState(number); return res.json({ optedOut: true, reply: STOP_CONFIRM }); }
+    if (resumeIntent(content)) { optedOut.delete(number); if (customerId.has(number)) saveCustomerState(number); return res.json({ optedOut: false, reply: START_CONFIRM }); }
+    if (optedOut.has(number)) return res.json({ suppressed: true, reply: helpIntent(content) ? HELP_REPLY : null });
     const paid = paidFlag !== undefined ? !!paidFlag : (isPaid(number) || await lazyStripeCheck(number));
     const history = getHistory(number);
     history.push({ role: "user", content });
